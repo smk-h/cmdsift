@@ -1,0 +1,186 @@
+# cmdsift 发布流水线
+#
+# 触发条件:
+#   push 到 main 分支, 且 head commit 的提交信息中包含 [release] 时,
+#   自动从 Cargo.toml 读取版本号创建 tag (v<x.y.z>) 并发布 GitHub Release.
+#
+# 构建成果物（参考 ripgrep 的 release 流水线）:
+#   - cmdsift-v<x.y.z>-x86_64-unknown-linux-musl.tar.gz  (Linux x86_64/amd64, musl 静态链接)
+#   - cmdsift-v<x.y.z>-x86_64-pc-windows-msvc.zip        (Windows x86_64)
+#   每个压缩包附带对应的 .sha256 校验文件.
+#
+# 使用方式:
+#   1. 先修改 Cargo.toml 中的 version 字段
+#   2. 提交时信息中带上 [release], 例如:
+#        git commit -m "feat: 支持 xxx [release]"
+#   3. push 到 main 分支即可自动发布
+
+name: release
+
+# 触发方式: 仅监听 main 分支的 push 事件
+# 是否真正执行发布由下方 create-release 作业的 if 条件（提交信息含 [release]）决定
+on:
+  push:
+    branches:
+      - main
+
+# 授予 GITHUB_TOKEN 写权限, 用于创建 tag、创建 Release 和上传成果物
+permissions:
+  contents: write
+
+jobs:
+  # ========================================================
+  # 创建 tag 和 Release（仅当提交信息包含 [release]）
+  # ========================================================
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    # 门控: 只有 head commit 的提交信息包含 [release] 时才执行本作业
+    # 后续 build-release 依赖本作业, 会被一并跳过
+    if: contains(github.event.head_commit.message, '[release]')
+    # 输出给 build-release 作业使用
+    outputs:
+      version: ${{ env.VERSION }}
+      tag: ${{ env.TAG }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # 从 Cargo.toml 的 [package].version 提取版本号, 拼出 tag 名 (v<x.y.z>)
+      - name: Get version from Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$VERSION" ]; then
+            echo "failed to read version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG=v$VERSION" >> $GITHUB_ENV
+          echo "version is: $VERSION (tag: v$VERSION)"
+
+      # 创建附注 tag 并推送到远端; 已存在则跳过（保证流水线可重跑）
+      - name: Create tag
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG already exists, skip creating"
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+            echo "tag $TAG created and pushed"
+          fi
+
+      # 创建 Release 页面; --generate-notes 自动生成 changelog
+      # （分类规则见 .github/release.yml）; 已存在则跳过
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists, skip creating"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+
+  # ========================================================
+  # 矩阵构建 Windows / Linux 成果物并上传到 Release
+  # ========================================================
+  build-release:
+    name: build-release
+    needs: create-release            # 等待 tag 和 Release 创建完成后再构建
+    runs-on: ${{ matrix.os }}
+    env:
+      RUST_BACKTRACE: 1              # panic 时输出调用栈, 便于排查构建问题
+    strategy:
+      fail-fast: false               # 单个平台失败不取消其他平台的构建
+      matrix:
+        include:
+          # Linux x86_64/amd64: musl 静态链接, 产物可在任意发行版直接运行
+          - build: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # Windows x86_64: MSVC 工具链
+          - build: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # 安装最新 stable 版 Rust 工具链及对应的交叉编译 target
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # musl 目标需要 musl-gcc 链接器（Windows 无需此步）
+      - name: Install musl tools (Linux)
+        if: matrix.build == 'linux'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # 编译 release 产物, 并把可执行文件路径写入 $BIN 供后续步骤使用
+      - name: Build release binary
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          if [[ "${{ matrix.os }}" == windows-* ]]; then
+            bin="target/${{ matrix.target }}/release/cmdsift.exe"
+          else
+            bin="target/${{ matrix.target }}/release/cmdsift"
+          fi
+          echo "BIN=$bin" >> $GITHUB_ENV
+          "$BIN" --version || true
+
+      # 剔除符号表, 减小产物体积
+      - name: Strip release binary (Linux)
+        if: matrix.build == 'linux'
+        shell: bash
+        run: strip "$BIN"
+
+      # 压缩包命名: cmdsift-v<x.y.z>-<target>
+      - name: Determine archive name
+        shell: bash
+        run: |
+          tag="${{ needs.create-release.outputs.tag }}"
+          echo "ARCHIVE=cmdsift-$tag-${{ matrix.target }}" >> $GITHUB_ENV
+
+      # 将可执行文件与 README、LICENSE 一起放入待打包目录
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir -p "$ARCHIVE"
+          cp "$BIN" "$ARCHIVE"/
+          cp README.md LICENSE "$ARCHIVE"/
+
+      # Windows 打 zip 包并生成 sha256 校验文件
+      - name: Build archive (Windows)
+        if: matrix.build == 'windows'
+        shell: bash
+        run: |
+          7z a "$ARCHIVE.zip" "$ARCHIVE"
+          sha256sum "$ARCHIVE.zip" > "$ARCHIVE.zip.sha256"
+          echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
+          echo "ASSET_SUM=$ARCHIVE.zip.sha256" >> $GITHUB_ENV
+
+      # Linux 打 tar.gz 包并生成 sha256 校验文件
+      - name: Build archive (Linux)
+        if: matrix.build == 'linux'
+        shell: bash
+        run: |
+          tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+          sha256sum "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+          echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
+          echo "ASSET_SUM=$ARCHIVE.tar.gz.sha256" >> $GITHUB_ENV
+
+      # 上传压缩包和校验文件到 Release 页面; --clobber 允许重跑时覆盖同名资产
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ needs.create-release.outputs.tag }}"
+          gh release upload "$tag" "$ASSET" "$ASSET_SUM" --clobber

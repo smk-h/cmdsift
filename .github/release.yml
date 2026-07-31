@@ -1,0 +1,25 @@
+# GitHub 自动生成 Release Notes 的分类配置
+# 配合 release 流水线中的 `gh release create --generate-notes` 使用
+# 按 PR 的 label 将变更归类到不同小节
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking-change
+    - title: New Features
+      labels:
+        - enhancement
+        - feature
+    - title: Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"
