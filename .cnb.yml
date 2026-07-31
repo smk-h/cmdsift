@@ -4,6 +4,19 @@ include:
   - .cnb/workflows/cnb-build-image.yml
 # - .cnb/workflows/cnb-crontab.yml
 
+main:
+  push:
+    - stages:
+        - name: sync to sumumm'github
+          image: tencentcom/git-sync
+          imports: https://cnb.cool/sumu.k/secret-key/-/blob/main/access-token.yml
+          settings:
+            target_url: https://github.com/smk-h/cmdsift.git
+            auth_type: https
+            username: sumumm
+            password: ${GITHUB_CNB_SYNC}
+            force: true
+
 $:
   vscode:
     - docker:
