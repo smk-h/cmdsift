@@ -30,3 +30,4 @@ log
 *.o
 *.out
 .zcode/plans
+build
