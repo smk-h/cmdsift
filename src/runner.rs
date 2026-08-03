@@ -236,6 +236,7 @@ pub fn run_build(
 mod tests {
     use super::*;
 
+    use crate::log::tests::{assert_all_lines_timestamped, strip_timestamps};
     use std::fs;
     use std::path::PathBuf;
 
@@ -346,7 +347,9 @@ mod tests {
 
         assert_eq!(outcome.exit_code, Some(0));
         let content = fs::read_to_string(&log_path).unwrap();
-        assert_eq!(content, "line1\nline2\n");
+        // 日志每一行都应带时间戳前缀
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "line1\nline2");
         assert!(!content.contains(BUILD_MARKER));
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -22,6 +22,8 @@ use crate::sanitize::sanitize;
 
 // 日志文件名时间戳格式：YYYYMMDD_HHMMSS（本地时间，编译开始时刻）
 pub const LOG_TIMESTAMP_FMT: &str = "%Y%m%d_%H%M%S";
+// 日志行时间戳格式：[YYYY-MM-DD HH:MM:SS]（本地时间，写盘时刻）
+pub const LOG_LINE_TIMESTAMP_FMT: &str = "%Y-%m-%d %H:%M:%S";
 
 /**
  * @brief 增量日志写入器
@@ -123,6 +125,8 @@ impl LogWriter {
      * @brief 批量落盘：把 pending 中累积的完整行整体 sanitize 后写入文件
      *
      * 每 2 秒（即每次轮询 drain 后）调用一次，写盘次数与输出规模解耦。
+     * 写入文件时给每一行加上时间戳前缀 `[YYYY-MM-DD HH:MM:SS] `
+     * （时间戳取本批落盘时刻，同一批共享，避免逐行取时间戳的开销）。
      * 写入失败则禁用文件写入并返回错误（不影响编译主流程）。
      */
     pub fn flush(&mut self) -> io::Result<()> {
@@ -130,9 +134,16 @@ impl LogWriter {
             return Ok(());
         }
         let clean = sanitize(&self.pending);
+        // 为日志每一行加上时间戳前缀 [YYYY-MM-DD HH:MM:SS]
+        let timestamp = Local::now().format(LOG_LINE_TIMESTAMP_FMT).to_string();
+        let prefix = format!("[{timestamp}] ");
+        let timed: String = clean
+            .lines()
+            .map(|line| format!("{prefix}{line}\n"))
+            .collect();
         let result = {
             let file = self.file.as_mut().expect("file checked");
-            file.write_all(clean.as_bytes()).and_then(|_| file.flush())
+            file.write_all(timed.as_bytes()).and_then(|_| file.flush())
         };
         match result {
             Ok(()) => {
@@ -167,14 +178,38 @@ impl LogWriter {
     }
 }
 
+// 测试模块声明为 pub(crate)，供 main.rs / runner.rs 的测试复用时间戳断言辅助
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use regex::Regex;
     use std::fs;
 
     // 每个测试用独立子目录，避免并发测试下秒级文件名互相冲突
     fn unique_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cmdsift_log_{name}_{}", std::process::id()))
+    }
+
+    // 测试辅助：去除每行的时间戳前缀，返回纯日志内容
+    pub fn strip_timestamps(content: &str) -> String {
+        let re = Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ").unwrap();
+        content
+            .lines()
+            .map(|line| re.replace(line, "").into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // 测试辅助：断言每行都带有 [YYYY-MM-DD HH:MM:SS] 时间戳前缀
+    pub fn assert_all_lines_timestamped(content: &str) {
+        let re = Regex::new(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ").unwrap();
+        assert!(!content.is_empty(), "log content should not be empty");
+        for line in content.lines() {
+            assert!(
+                re.is_match(line),
+                "line missing timestamp prefix: {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -197,14 +232,15 @@ mod tests {
 
         writer.write_chunk("line1\nline2\n");
         writer.flush().expect("flush");
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "line1\nline2\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "line1\nline2");
 
         writer.write_chunk("line3\n");
         writer.finish();
-        assert_eq!(
-            fs::read_to_string(writer.path()).unwrap(),
-            "line1\nline2\nline3\n"
-        );
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "line1\nline2\nline3");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -218,7 +254,9 @@ mod tests {
         writer.write_chunk("lo\nwor");
         writer.write_chunk("ld\n");
         writer.flush().expect("flush");
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "hello\nworld\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "hello\nworld");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -230,7 +268,9 @@ mod tests {
 
         writer.write_chunk("\x1b[0;32mwarning:\x1b[0m x\r\nnext\n");
         writer.flush().expect("flush");
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "warning: x\nnext\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "warning: x\nnext");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -243,7 +283,8 @@ mod tests {
         writer.write_chunk("compiling...\n___MCP_BUILD_DONE___:0\n");
         writer.finish();
         let content = fs::read_to_string(writer.path()).unwrap();
-        assert_eq!(content, "compiling...\n");
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "compiling...");
         assert!(!content.contains(BUILD_MARKER));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -258,7 +299,8 @@ mod tests {
         writer.write_chunk("ILD_DONE___:0\n");
         writer.finish();
         let content = fs::read_to_string(writer.path()).unwrap();
-        assert_eq!(content, "hello\n");
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "hello");
         assert!(!content.contains(BUILD_MARKER));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -271,10 +313,9 @@ mod tests {
 
         writer.write_chunk("line1\nline2-no-newline");
         writer.finish();
-        assert_eq!(
-            fs::read_to_string(writer.path()).unwrap(),
-            "line1\nline2-no-newline\n"
-        );
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "line1\nline2-no-newline");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -284,7 +325,9 @@ mod tests {
         assert_eq!(writer.path().parent().unwrap(), Path::new("log"));
         writer.write_chunk("hello\n");
         writer.finish();
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "hello\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "hello");
         fs::remove_file(writer.path()).unwrap();
         // 清理测试创建的 log 目录（仅当为空时）
         let _ = fs::remove_dir("log");

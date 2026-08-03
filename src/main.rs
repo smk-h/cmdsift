@@ -96,7 +96,8 @@ fn print_help() {
   分类模式（默认）：构建状态 + 统计摘要 + 编号错误列表 + 编号警告列表
   非分类模式：构建状态 + 输出尾部 {TAIL_LINES} 行
   日志文件：默认写入当前目录的 log/ 下 <YYYYMMDD_HHMMSS>.log，
-            编译过程中边采集边写入（约每 2 秒批量落盘一次），记录完整编译输出
+            编译过程中边采集边写入（约每 2 秒批量落盘一次），记录完整编译输出；
+            日志每一行都带有 [YYYY-MM-DD HH:MM:SS] 时间戳前缀（写盘时刻）
 
 退出码:
   编译命令的退出码；超时 {EXIT_TIMEOUT}；参数错误 {EXIT_USAGE}；启动失败 {EXIT_SPAWN}
@@ -329,6 +330,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::tests::{assert_all_lines_timestamped, strip_timestamps};
     use std::fs;
     use std::path::Path;
 
@@ -351,7 +353,9 @@ mod tests {
         writer.write_chunk(content);
         writer.finish();
         let written = fs::read_to_string(writer.path()).unwrap();
-        assert_eq!(written, content);
+        // 日志每一行都应带时间戳前缀，内容与原始输出一致
+        assert_all_lines_timestamped(&written);
+        assert_eq!(strip_timestamps(&written), "main.c:1: error: boom\nCompiling...");
         fs::remove_file(writer.path()).unwrap();
     }
 
@@ -363,7 +367,9 @@ mod tests {
         assert!(writer.path().exists());
         writer.write_chunk("hello\n");
         writer.finish();
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "hello\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "hello");
         fs::remove_file(writer.path()).unwrap();
         // 清理测试创建的 log 目录（仅当为空时）
         let _ = fs::remove_dir("log");
@@ -379,7 +385,9 @@ mod tests {
         assert!(writer.path().exists());
         writer.write_chunk("auto-create\n");
         writer.finish();
-        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "auto-create\n");
+        let content = fs::read_to_string(writer.path()).unwrap();
+        assert_all_lines_timestamped(&content);
+        assert_eq!(strip_timestamps(&content), "auto-create");
         fs::remove_file(writer.path()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
