@@ -21,6 +21,7 @@ mod runner;
 mod sanitize;
 
 use std::env;
+use std::path::Path;
 use std::process;
 use std::time::Duration;
 
@@ -56,7 +57,7 @@ struct Cli {
     classify: bool,
     // 是否将完整编译输出写入日志文件（默认 true，--no-log-file 关闭）
     log_enabled: bool,
-    // 日志文件所在目录（None 时用当前工作目录）
+    // 日志文件所在目录（None 时默认用当前工作目录或 -C 指定目录下的 log/）
     log_dir: Option<String>,
 }
 
@@ -87,7 +88,8 @@ fn print_help() {
   -m, --max-wait <毫秒>      最大等待时间（默认 {DEFAULT_MAX_WAIT_MS}，即 10 分钟）
   -p, --poll-interval <毫秒> 轮询间隔（默认 {DEFAULT_POLL_INTERVAL_MS}）
       --no-classify          关闭输出分类，仅返回输出尾部 {TAIL_LINES} 行
-  -L, --log-file <目录>      完整输出日志写入该目录（默认当前目录下的 log/）
+  -L, --log-file <目录>      完整输出日志写入该目录（默认写入待编译项目所在目录的 log/，
+                            即 -C <目录> 时写入 <目录>/log/，否则写入当前目录的 log/）
       --no-log-file          不写日志文件（默认每次调用都会写）
   -h, --help                 显示本帮助
   -V, --version              显示版本
@@ -95,7 +97,8 @@ fn print_help() {
 输出:
   分类模式（默认）：构建状态 + 统计摘要 + 编号错误列表 + 编号警告列表
   非分类模式：构建状态 + 输出尾部 {TAIL_LINES} 行
-  日志文件：默认写入当前目录的 log/ 下 <YYYYMMDD_HHMMSS>.log，
+  日志文件：默认写入待编译项目所在目录的 log/ 下 <YYYYMMDD_HHMMSS>.log
+            （-C <目录> 时写入 <目录>/log/，否则写入当前目录的 log/），
             编译过程中边采集边写入（约每 2 秒批量落盘一次），记录完整编译输出；
             日志每一行都带有 [YYYY-MM-DD HH:MM:SS] 时间戳前缀（写盘时刻）
 
@@ -145,13 +148,32 @@ fn parse_ms(raw_value: String, option_name: &str) -> Result<u64, String> {
 }
 
 /**
+ * @brief 解析实际日志目录
+ *
+ * 规则（按优先级）：
+ *   1. --log-file 显式指定 → 使用该目录
+ *   2. -C/--cwd 指定 → <cwd>/log（默认跟随待编译项目所在目录）
+ *   3. 两者都未指定 → 进程当前目录的 log/
+ *
+ * @param log_dir  --log-file 指定目录（可为 None）
+ * @param cwd      -C/--cwd 指定目录（可为 None）
+ * @return 实际日志目录；None 表示使用默认相对目录 "log"
+ */
+fn resolve_log_dir(log_dir: Option<&str>, cwd: Option<&str>) -> Option<String> {
+    log_dir.map(str::to_string).or_else(|| {
+        cwd.map(|c| Path::new(c).join("log").to_string_lossy().into_owned())
+    })
+}
+
+/**
  * @brief 打开增量日志写入器
  *
  * 落盘是附属能力：创建/写入失败仅打印一行 stderr 警告，不 panic、不影响退出码，
  * 确保编译结果始终能正常返回（编译结果优先于日志留存）。
  *
  * 文件名以本地时间命名（编译开始时刻，YYYYMMDD_HHMMSS.log），
- * 默认写入当前工作目录下的 log/ 子目录；可用 --log-file 指定其它目录。
+ * 默认写入待编译项目所在目录的 log/ 子目录（-C 指定目录，未指定则用当前目录）；
+ * 可用 --log-file 指定其它目录。
  *
  * @param log_dir   日志目录（None 时用默认目录 "log"）
  * @return 成功时返回日志写入器（含已打开的文件）；失败返回 None
@@ -258,7 +280,10 @@ fn main() {
     // 落盘失败不影响主流程与退出码。路径提示走 stderr，不污染 stdout。
     let mut log_writer: Option<LogWriter> = None;
     if cli.log_enabled {
-        log_writer = open_log_writer(cli.log_dir.as_deref());
+        // 默认日志目录跟随待编译项目目录：-C <目录> 时写入 <目录>/log/，
+        // 否则写入进程当前目录的 log/；--log-file 显式指定时优先。
+        let log_dir = resolve_log_dir(cli.log_dir.as_deref(), cli.cwd.as_deref());
+        log_writer = open_log_writer(log_dir.as_deref());
     }
 
     let outcome = match run_build(
@@ -336,6 +361,27 @@ mod tests {
 
     // 用唯一的临时文件名避免并行测试冲突；测试后清理
     #[test]
+    fn resolve_log_dir_priorities() {
+        // --log-file 显式指定时优先于 -C
+        assert_eq!(
+            resolve_log_dir(Some("/var/log"), Some("/srv/kernel")),
+            Some("/var/log".to_string())
+        );
+        // 仅 -C 时跟随待编译项目目录：<cwd>/log
+        assert_eq!(
+            resolve_log_dir(None, Some("/srv/kernel")),
+            Some("/srv/kernel/log".to_string())
+        );
+        // 相对 -C 目录也支持
+        assert_eq!(
+            resolve_log_dir(None, Some("proj")),
+            Some("proj/log".to_string())
+        );
+        // 两者都未指定：None → 使用默认相对目录 "log"
+        assert_eq!(resolve_log_dir(None, None), None);
+    }
+
+    #[test]
     fn open_log_writer_writes_content_to_given_dir() {
         let dir = std::env::temp_dir();
         let content = "main.c:1: error: boom\nCompiling...\n";
@@ -361,7 +407,7 @@ mod tests {
 
     #[test]
     fn open_log_writer_uses_default_dir_when_none() {
-        // log_dir = None 时应写入默认目录 "log"
+        // log_dir = None 时应写入默认目录 "log"（相对进程当前工作目录）
         let mut writer = open_log_writer(None).expect("should write to default log dir");
         assert_eq!(writer.path().parent().unwrap(), Path::new("log"));
         assert!(writer.path().exists());
