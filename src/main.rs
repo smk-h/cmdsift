@@ -16,17 +16,16 @@
 
 mod classify;
 mod command;
+mod log;
 mod runner;
 mod sanitize;
 
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 
-use chrono::Local;
 use classify::{BuildCollector, TAIL_LINES, collect_output, format_build_result, tail_lines};
+use log::LogWriter;
 use runner::run_build;
 use sanitize::sanitize;
 
@@ -41,8 +40,7 @@ const EXIT_USAGE: i32 = 2;
 // 命令启动失败退出码
 const EXIT_SPAWN: i32 = 126;
 
-// 日志文件名时间戳格式：YYYYMMDD_HHMMSS（本地时间）
-const LOG_TIMESTAMP_FMT: &str = "%Y%m%d_%H%M%S";
+// 日志文件名时间戳格式：YYYYMMDD_HHMMSS（本地时间），定义于 log.rs
 
 // 命令行参数
 struct Cli {
@@ -97,7 +95,8 @@ fn print_help() {
 输出:
   分类模式（默认）：构建状态 + 统计摘要 + 编号错误列表 + 编号警告列表
   非分类模式：构建状态 + 输出尾部 {TAIL_LINES} 行
-  日志文件：默认写入当前目录的 log/ 下 <YYYYMMDD_HHMMSS>.log，记录完整编译输出
+  日志文件：默认写入当前目录的 log/ 下 <YYYYMMDD_HHMMSS>.log，
+            编译过程中边采集边写入（约每 2 秒批量落盘一次），记录完整编译输出
 
 退出码:
   编译命令的退出码；超时 {EXIT_TIMEOUT}；参数错误 {EXIT_USAGE}；启动失败 {EXIT_SPAWN}
@@ -145,38 +144,19 @@ fn parse_ms(raw_value: String, option_name: &str) -> Result<u64, String> {
 }
 
 /**
- * @brief 将完整编译输出写入日志文件
+ * @brief 打开增量日志写入器
  *
- * 落盘是附属能力：写入失败仅打印一行 stderr 警告，不 panic、不影响退出码，
+ * 落盘是附属能力：创建/写入失败仅打印一行 stderr 警告，不 panic、不影响退出码，
  * 确保编译结果始终能正常返回（编译结果优先于日志留存）。
  *
  * 文件名以本地时间命名（编译开始时刻，YYYYMMDD_HHMMSS.log），
  * 默认写入当前工作目录下的 log/ 子目录；可用 --log-file 指定其它目录。
  *
  * @param log_dir   日志目录（None 时用默认目录 "log"）
- * @param content   经 sanitize 清洗后的完整编译输出
- * @return 成功时返回写入的文件路径；失败返回 None
+ * @return 成功时返回日志写入器（含已打开的文件）；失败返回 None
  */
-fn write_log_file(log_dir: Option<&str>, content: &str) -> Option<PathBuf> {
-    let dir = log_dir.unwrap_or("log");
-    let timestamp = Local::now().format(LOG_TIMESTAMP_FMT).to_string();
-    let file_name = format!("{timestamp}.log");
-    let path = Path::new(dir).join(file_name);
-
-    // 目标目录可能尚不存在（如默认的 log/），先递归创建；
-    // create_dir_all 在目录已存在时不报错，幂等。
-    if let Err(error) = fs::create_dir_all(dir) {
-        eprintln!("cmdsift: failed to create log dir {dir}: {error}");
-        return None;
-    }
-
-    match fs::write(&path, content) {
-        Ok(()) => Some(path),
-        Err(error) => {
-            eprintln!("cmdsift: failed to write log file {}: {error}", path.display());
-            None
-        }
-    }
+fn open_log_writer(log_dir: Option<&str>) -> Option<LogWriter> {
+    LogWriter::create(log_dir)
 }
 
 /**
@@ -272,11 +252,20 @@ fn main() {
         }
     };
 
+    // ── 日志写盘（方案A增强版：边采集边写）──
+    // 编译开始时创建日志文件，采集线程每 2s 批量写一次完整行；
+    // 落盘失败不影响主流程与退出码。路径提示走 stderr，不污染 stdout。
+    let mut log_writer: Option<LogWriter> = None;
+    if cli.log_enabled {
+        log_writer = open_log_writer(cli.log_dir.as_deref());
+    }
+
     let outcome = match run_build(
         &cli.command,
         cli.cwd.as_deref(),
         Duration::from_millis(cli.max_wait_ms),
         Duration::from_millis(cli.poll_interval_ms),
+        log_writer.as_mut(),
     ) {
         Ok(outcome) => outcome,
         Err(spawn_error) => {
@@ -284,6 +273,11 @@ fn main() {
             process::exit(EXIT_SPAWN);
         }
     };
+
+    // run_build 返回时日志已边采边写完并完成收尾；此处仅提示路径
+    if let Some(writer) = log_writer {
+        eprintln!("cmdsift: log saved: {}", writer.path().display());
+    }
 
     // ── 超时/完成，统一格式化输出 ──
     // exit_code 为 None 表示超时（未检测到完成标记），否则为实际退出码
@@ -302,15 +296,6 @@ fn main() {
     // 分类正则，如 "\x1b[0;32mwarning:\x1b[0m" 中 warning 后是 ESC 而非冒号）。
     // 在标记剥离之后统一清洗，避免破坏 ___MCP_BUILD_DONE___ 检测。
     let output = sanitize(&outcome.output);
-
-    // 完整编译输出落盘（默认开启）。在 sanitize 之后、分类之前写入，
-    // 保留的是干净的可读完整日志。落盘失败不影响主流程与退出码。
-    // 路径提示走 stderr，不污染 stdout 的结构化输出（便于脚本/AI 解析）。
-    if cli.log_enabled {
-        if let Some(path) = write_log_file(cli.log_dir.as_deref(), &output) {
-            eprintln!("cmdsift: log saved: {}", path.display());
-        }
-    }
 
     if cli.classify {
         let mut collector = BuildCollector::default();
@@ -345,50 +330,57 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     // 用唯一的临时文件名避免并行测试冲突；测试后清理
     #[test]
-    fn write_log_file_writes_content_to_given_dir() {
+    fn open_log_writer_writes_content_to_given_dir() {
         let dir = std::env::temp_dir();
         let content = "main.c:1: error: boom\nCompiling...\n";
-        let path = write_log_file(dir.to_str(), content)
-            .expect("should write log file to temp dir");
+        let mut writer = open_log_writer(dir.to_str())
+            .expect("should open log writer in temp dir");
 
         // 文件名形如 YYYYMMDD_HHMMSS.log
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let name = writer.path().file_name().unwrap().to_string_lossy().to_string();
         assert!(
             name.len() == "YYYYMMDD_HHMMSS.log".len()
                 && name.ends_with(".log"),
             "unexpected log file name: {name}"
         );
 
-        let written = fs::read_to_string(&path).unwrap();
+        writer.write_chunk(content);
+        writer.finish();
+        let written = fs::read_to_string(writer.path()).unwrap();
         assert_eq!(written, content);
-        fs::remove_file(path).unwrap();
+        fs::remove_file(writer.path()).unwrap();
     }
 
     #[test]
-    fn write_log_file_uses_default_dir_when_none() {
+    fn open_log_writer_uses_default_dir_when_none() {
         // log_dir = None 时应写入默认目录 "log"
-        let path = write_log_file(None, "hello").expect("should write to default log dir");
-        assert_eq!(path.parent().unwrap(), Path::new("log"));
-        assert!(path.exists());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
-        fs::remove_file(path).unwrap();
+        let mut writer = open_log_writer(None).expect("should write to default log dir");
+        assert_eq!(writer.path().parent().unwrap(), Path::new("log"));
+        assert!(writer.path().exists());
+        writer.write_chunk("hello\n");
+        writer.finish();
+        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "hello\n");
+        fs::remove_file(writer.path()).unwrap();
         // 清理测试创建的 log 目录（仅当为空时）
         let _ = fs::remove_dir("log");
     }
 
     #[test]
-    fn write_log_file_creates_missing_dir() {
+    fn open_log_writer_creates_missing_dir() {
         // 指定目录不存在时应自动创建（create_dir_all）
         let dir = std::env::temp_dir().join("cmdsift_test_subdir");
         let _ = fs::remove_dir_all(&dir); // 确保起始为干净状态
-        let path = write_log_file(dir.to_str(), "auto-create")
+        let mut writer = open_log_writer(dir.to_str())
             .expect("should create missing dir and write file");
-        assert!(path.exists());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "auto-create");
-        fs::remove_file(&path).unwrap();
+        assert!(writer.path().exists());
+        writer.write_chunk("auto-create\n");
+        writer.finish();
+        assert_eq!(fs::read_to_string(writer.path()).unwrap(), "auto-create\n");
+        fs::remove_file(writer.path()).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

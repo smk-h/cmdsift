@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::command::{BUILD_MARKER, build_remote_command};
+use crate::log::LogWriter;
 
 // 子进程已退出但标记未匹配时的残余输出宽限时间
 const EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -129,6 +130,7 @@ pub fn run_build(
     cwd: Option<&str>,
     max_wait: Duration,
     poll_interval: Duration,
+    mut log: Option<&mut LogWriter>,
 ) -> io::Result<BuildOutcome> {
     // ── 步骤 1：构造 shell 命令 ──
     // full_command 形如：
@@ -162,10 +164,21 @@ pub fn run_build(
     let deadline = Instant::now() + max_wait;
     let mut all_output = String::new();
     let mut exit_code: Option<i32> = None;
+    // 已写入日志的字节位置（增量写盘：只写新采集到的部分）
+    let mut last_log_len = 0usize;
 
     loop {
         thread::sleep(poll_interval);
         drain_buffer(&buffer, &mut all_output);
+
+        // 增量写盘：先把新采集内容落盘（方案A增强版，每 2s 一次）。
+        // 在 match_marker 之前写入，确保 LogWriter 能看到完整的完成标记并自行截断。
+        if let Some(writer) = log.as_deref_mut() {
+            last_log_len = last_log_len.min(all_output.len());
+            writer.write_chunk(&all_output[last_log_len..]);
+            let _ = writer.flush();
+            last_log_len = all_output.len();
+        }
 
         if let Some(code) = match_marker(&marker_regex, &mut all_output) {
             exit_code = Some(code);
@@ -202,6 +215,14 @@ pub fn run_build(
     wait_readers(&reader_threads, DRAIN_GRACE);
     drain_buffer(&buffer, &mut all_output);
     all_output = all_output.trim_end().to_string();
+
+    // ── 收尾：把收尾阶段采集到的残余内容写入日志并 flush 半行 ──
+    if let Some(writer) = log.as_deref_mut() {
+        last_log_len = last_log_len.min(all_output.len());
+        writer.write_chunk(&all_output[last_log_len..]);
+        writer.finish();
+    }
+
     // 显式 detach 采集线程句柄（线程已随管道 EOF 结束或即将结束）
     drop(reader_threads);
 
@@ -215,6 +236,9 @@ pub fn run_build(
 mod tests {
     use super::*;
 
+    use std::fs;
+    use std::path::PathBuf;
+
     #[test]
     fn captures_output_and_success_code() {
         let outcome = run_build(
@@ -222,6 +246,7 @@ mod tests {
             None,
             Duration::from_secs(10),
             Duration::from_millis(50),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.exit_code, Some(0));
@@ -235,6 +260,7 @@ mod tests {
             None,
             Duration::from_secs(10),
             Duration::from_millis(50),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.exit_code, Some(3));
@@ -249,6 +275,7 @@ mod tests {
             None,
             Duration::from_secs(10),
             Duration::from_millis(50),
+            None,
         )
         .unwrap();
         assert!(outcome.output.contains("to-stderr"));
@@ -261,6 +288,7 @@ mod tests {
             Some("/tmp"),
             Duration::from_secs(10),
             Duration::from_millis(50),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.exit_code, Some(0));
@@ -274,6 +302,7 @@ mod tests {
             Some("/nonexistent-dir-xyz"),
             Duration::from_secs(10),
             Duration::from_millis(50),
+            None,
         )
         .unwrap();
         assert_ne!(outcome.exit_code, Some(0));
@@ -288,9 +317,59 @@ mod tests {
             None,
             Duration::from_millis(600),
             Duration::from_millis(100),
+            None,
         )
         .unwrap();
         assert_eq!(outcome.exit_code, None);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    fn unique_log_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("cmdsift_runner_{name}_{}", std::process::id()))
+    }
+
+    #[test]
+    fn writes_incrementally_and_strips_marker() {
+        let dir = unique_log_dir("incremental");
+        let _ = fs::remove_dir_all(&dir);
+        let mut writer = LogWriter::create(dir.to_str()).expect("create writer");
+        let log_path = writer.path().to_path_buf();
+
+        let outcome = run_build(
+            "echo line1; echo line2",
+            None,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            Some(&mut writer),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.exit_code, Some(0));
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(content, "line1\nline2\n");
+        assert!(!content.contains(BUILD_MARKER));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn does_not_write_log_when_disabled() {
+        let dir = unique_log_dir("disabled");
+        let _ = fs::remove_dir_all(&dir);
+
+        let outcome = run_build(
+            "echo nothing-logged",
+            None,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+        // 未启用日志写入器，目录应保持为空
+        assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+        // 目录可能不存在，清理时容忍 NotFound
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
